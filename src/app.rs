@@ -683,11 +683,18 @@ fn slot_decoded_delta(previous: &HashMap<i64, SlotCounters>, slots: &[SlotInfo])
             let before = previous.get(&slot.id)?;
             let current = SlotCounters::from(slot);
 
-            // A counter reset identifies a new request. When llama.cpp exposes
-            // task IDs, also skip the transition sample so old and new work is
-            // never combined into one rate.
             if before.task_id != current.task_id {
-                return None;
+                // Task transition. If the decoded counter reset (current <
+                // before), the new task's count is the valid delta for this
+                // interval — those tokens were genuinely generated since the
+                // last poll. If the counter did not reset, the raw difference
+                // is the real number of new tokens. In both cases the result
+                // is clamped to non-negative.
+                return Some(if current.decoded_tokens < before.decoded_tokens {
+                    current.decoded_tokens.max(0)
+                } else {
+                    (current.decoded_tokens - before.decoded_tokens).max(0)
+                });
             }
 
             Some((current.decoded_tokens - before.decoded_tokens).max(0))
@@ -717,15 +724,28 @@ mod tests {
         ]);
         let current = vec![slot(0, 9, 1), slot(1, 8, 46)];
 
-        assert_eq!(slot_decoded_delta(&previous, &current), 6);
+        // Slot 0: task changed 7->9, counter reset 20->1, delta = 1.
+        // Slot 1: same task 8, 40->46, delta = 6.
+        assert_eq!(slot_decoded_delta(&previous, &current), 7);
     }
 
     #[test]
-    fn generation_changed_task_is_ignored_for_its_transition_sample() {
+    fn generation_changed_task_with_counter_reset_uses_current_count() {
+        let previous = HashMap::from([(0, SlotCounters::from(&slot(0, 7, 20)))]);
+        let current = vec![slot(0, 8, 5)];
+
+        // Task changed, counter reset to 5 — those 5 tokens were generated
+        // since the last poll on the new task.
+        assert_eq!(slot_decoded_delta(&previous, &current), 5);
+    }
+
+    #[test]
+    fn generation_changed_task_without_counter_reset_uses_difference() {
         let previous = HashMap::from([(0, SlotCounters::from(&slot(0, 7, 20)))]);
         let current = vec![slot(0, 8, 22)];
 
-        assert_eq!(slot_decoded_delta(&previous, &current), 0);
+        // Task changed, counter continued 20->22, delta = 2.
+        assert_eq!(slot_decoded_delta(&previous, &current), 2);
     }
 
     fn prompt_metrics(tokens: f64, seconds: f64, server_average: f64) -> Metrics {
