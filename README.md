@@ -6,6 +6,13 @@ ltop combines llama.cpp request telemetry with host GPU statistics in a responsi
 
 The interface uses one configurable polling cadence, supports btop-compatible themes, and adapts from a complete dashboard to focused section views on smaller terminals.
 
+## Screenshots
+
+![ltop dashboard](screenshots/ltop-dashboard.png)
+
+*The ltop dashboard monitoring a llama.cpp server.*
+
+
 ## Highlights
 
 - Server-timed prompt-evaluation throughput and live generation throughput
