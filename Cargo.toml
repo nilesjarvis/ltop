@@ -1,0 +1,24 @@
+[package]
+name = "ltop"
+version = "0.1.0"
+edition = "2021"
+default-run = "ltop"
+description = "btop-inspired TUI for llama.cpp server monitoring"
+
+[[bin]]
+name = "ltop"
+path = "src/main.rs"
+
+[[bin]]
+name = "ltop-shot"
+path = "src/screenshot.rs"
+
+[dependencies]
+ratatui = "0.29"
+crossterm = "0.28"
+ureq = { version = "2", features = ["json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+opt-level = 2

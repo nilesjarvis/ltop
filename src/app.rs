@@ -1,0 +1,898 @@
+#![allow(dead_code)]
+use crate::api::{self, Metrics, SlotInfo, Snapshot};
+use crate::theme::{
+    validate_update_ms, Theme, ThemeCatalog, ThemePreferences, DEFAULT_UPDATE_MS, MAX_UPDATE_MS,
+    MIN_UPDATE_MS,
+};
+use std::collections::{HashMap, VecDeque};
+use std::time::{Duration, Instant};
+
+pub const MAX_SAMPLES: usize = 120;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SlotCounters {
+    task_id: Option<i64>,
+    decoded_tokens: i64,
+}
+
+impl From<&SlotInfo> for SlotCounters {
+    fn from(slot: &SlotInfo) -> Self {
+        Self {
+            task_id: slot.task_id,
+            decoded_tokens: slot.decoded_tokens,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+struct PromptRateUpdate {
+    measurement: Option<PromptRateMeasurement>,
+    reset: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct PromptRateMeasurement {
+    tokens_per_second: f64,
+    basis: PromptRateBasis,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum PromptRateBasis {
+    #[default]
+    Unavailable,
+    Interval,
+    ServerAverage,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Section {
+    Overview,
+    Throughput,
+    Slots,
+    Gpu,
+    Help,
+}
+
+impl Section {
+    pub fn next(&self) -> Self {
+        match self {
+            Section::Overview => Section::Throughput,
+            Section::Throughput => Section::Slots,
+            Section::Slots => Section::Gpu,
+            Section::Gpu => Section::Overview,
+            Section::Help => Section::Overview,
+        }
+    }
+    pub fn prev(&self) -> Self {
+        match self {
+            Section::Overview => Section::Gpu,
+            Section::Throughput => Section::Overview,
+            Section::Slots => Section::Throughput,
+            Section::Gpu => Section::Slots,
+            Section::Help => Section::Overview,
+        }
+    }
+    pub fn name(&self) -> &str {
+        match self {
+            Section::Overview => "Overview",
+            Section::Throughput => "Throughput",
+            Section::Slots => "Slots",
+            Section::Gpu => "GPU",
+            Section::Help => "Help",
+        }
+    }
+}
+
+pub struct App {
+    pub url: String,
+    pub snapshot: Snapshot,
+    pub current_section: Section,
+    pub scroll: u16,
+    pub bits_mode: bool,
+    pub paused: bool,
+    pub show_help: bool,
+    pub show_theme_picker: bool,
+    pub theme: Theme,
+    pub theme_background: bool,
+    pub start_time: Instant,
+    pub last_poll: Instant,
+    pub update_ms: u64,
+    pub prompt_rate_history: VecDeque<f64>,
+    pub predict_rate_history: VecDeque<f64>,
+    pub gpu_util_history: VecDeque<f64>,
+    pub power_history: VecDeque<f64>,
+    pub mem_history: VecDeque<f64>,
+    pub requests_history: VecDeque<f64>,
+    pub total_prompt_tokens: f64,
+    pub total_predict_tokens: f64,
+    pub prompt_rate: f64,
+    pub prompt_rate_basis: PromptRateBasis,
+    pub predict_rate: f64,
+    theme_catalog: ThemeCatalog,
+    active_theme_index: usize,
+    picker_theme_index: usize,
+    theme_before_picker: usize,
+    background_before_picker: bool,
+    // Previous state is tracked per lane so one slot resetting cannot erase
+    // progress made by another slot in the same polling interval.
+    prev_slot_counters: HashMap<i64, SlotCounters>,
+    prev_rate_time: Option<Instant>,
+    next_poll: Instant,
+}
+
+impl App {
+    pub fn new(url: String) -> Self {
+        Self::with_update_ms(url, DEFAULT_UPDATE_MS)
+    }
+
+    pub fn with_update_ms(url: String, update_ms: u64) -> Self {
+        Self::with_theme_catalog_and_update_ms(
+            url,
+            ThemeCatalog::builtin_only(),
+            0,
+            true,
+            update_ms,
+        )
+    }
+
+    pub fn with_theme_catalog(
+        url: String,
+        theme_catalog: ThemeCatalog,
+        active_theme_index: usize,
+        theme_background: bool,
+    ) -> Self {
+        Self::with_theme_catalog_and_update_ms(
+            url,
+            theme_catalog,
+            active_theme_index,
+            theme_background,
+            DEFAULT_UPDATE_MS,
+        )
+    }
+
+    pub fn with_theme_catalog_and_update_ms(
+        url: String,
+        theme_catalog: ThemeCatalog,
+        active_theme_index: usize,
+        theme_background: bool,
+        update_ms: u64,
+    ) -> Self {
+        let now = Instant::now();
+        let update_ms = update_ms.clamp(MIN_UPDATE_MS, MAX_UPDATE_MS);
+        let active_theme_index = active_theme_index.min(theme_catalog.len().saturating_sub(1));
+        let theme = theme_catalog.theme(active_theme_index).clone();
+        Self {
+            url,
+            snapshot: Snapshot::new(),
+            current_section: Section::Overview,
+            scroll: 0,
+            bits_mode: false,
+            paused: false,
+            show_help: false,
+            show_theme_picker: false,
+            theme,
+            theme_background,
+            start_time: now,
+            last_poll: now,
+            update_ms,
+            prompt_rate_history: VecDeque::with_capacity(MAX_SAMPLES),
+            predict_rate_history: VecDeque::with_capacity(MAX_SAMPLES),
+            gpu_util_history: VecDeque::with_capacity(MAX_SAMPLES),
+            power_history: VecDeque::with_capacity(MAX_SAMPLES),
+            mem_history: VecDeque::with_capacity(MAX_SAMPLES),
+            requests_history: VecDeque::with_capacity(MAX_SAMPLES),
+            total_prompt_tokens: 0.0,
+            total_predict_tokens: 0.0,
+            prompt_rate: 0.0,
+            prompt_rate_basis: PromptRateBasis::Unavailable,
+            predict_rate: 0.0,
+            theme_catalog,
+            active_theme_index,
+            picker_theme_index: active_theme_index,
+            theme_before_picker: active_theme_index,
+            background_before_picker: theme_background,
+            prev_slot_counters: HashMap::new(),
+            prev_rate_time: None,
+            // The first collection is due immediately, before the first draw.
+            next_poll: now,
+        }
+    }
+
+    pub fn next_section(&mut self) {
+        self.current_section = self.current_section.next();
+        self.scroll = 0;
+    }
+
+    pub fn prev_section(&mut self) {
+        self.current_section = self.current_section.prev();
+        self.scroll = 0;
+    }
+
+    pub fn scroll_up(&mut self) {
+        if self.scroll > 0 {
+            self.scroll -= 1;
+        }
+    }
+
+    pub fn scroll_down(&mut self) {
+        let max_scroll = match self.current_section {
+            Section::Slots => self.snapshot.slots.len().saturating_sub(1),
+            Section::Gpu => self.snapshot.gpus.len().saturating_sub(1),
+            _ => 0,
+        };
+        self.scroll = (self.scroll as usize + 1).min(max_scroll) as u16;
+    }
+
+    pub fn toggle_rate_unit(&mut self) {
+        self.bits_mode = !self.bits_mode;
+    }
+
+    pub fn toggle_pause(&mut self) {
+        self.paused = !self.paused;
+        if !self.paused {
+            // Resume with a fresh universal snapshot. Slot counters cannot be
+            // divided by time spent paused without producing a false rate.
+            self.next_poll = Instant::now();
+            self.prev_slot_counters.clear();
+            self.prev_rate_time = None;
+        }
+    }
+
+    pub fn poll_wait(&self) -> Duration {
+        if self.paused {
+            return Duration::from_secs(1);
+        }
+        self.next_poll.saturating_duration_since(Instant::now())
+    }
+
+    pub fn update_interval_label(&self) -> String {
+        if self.update_ms >= 3_600_000 {
+            let hours = self.update_ms as f64 / 3_600_000.0;
+            if evenly_divisible(self.update_ms, 3_600_000) {
+                format!("{hours:.0}h")
+            } else {
+                format!("{hours:.1}h")
+            }
+        } else if self.update_ms >= 60_000 {
+            let minutes = self.update_ms as f64 / 60_000.0;
+            if evenly_divisible(self.update_ms, 60_000) {
+                format!("{minutes:.0}m")
+            } else {
+                format!("{minutes:.1}m")
+            }
+        } else if self.update_ms >= 1_000 {
+            let seconds = self.update_ms as f64 / 1_000.0;
+            if evenly_divisible(self.update_ms, 1_000) {
+                format!("{seconds:.0}s")
+            } else {
+                format!("{seconds:.1}s")
+            }
+        } else {
+            format!("{}ms", self.update_ms)
+        }
+    }
+
+    pub fn increase_update_interval(&mut self) -> Result<(), String> {
+        let update_ms = self.update_ms.saturating_add(100).min(MAX_UPDATE_MS);
+        if update_ms == self.update_ms {
+            return Ok(());
+        }
+        self.set_update_interval(update_ms)
+    }
+
+    pub fn decrease_update_interval(&mut self) -> Result<(), String> {
+        let update_ms = self.update_ms.saturating_sub(100).max(MIN_UPDATE_MS);
+        if update_ms == self.update_ms {
+            return Ok(());
+        }
+        self.set_update_interval(update_ms)
+    }
+
+    fn set_update_interval(&mut self, update_ms: u64) -> Result<(), String> {
+        self.update_ms = validate_update_ms(update_ms)?;
+        self.next_poll = Instant::now()
+            .checked_add(Duration::from_millis(self.update_ms))
+            .unwrap_or_else(Instant::now);
+        self.save_preferences()
+    }
+
+    fn save_preferences(&self) -> Result<(), String> {
+        ThemePreferences {
+            theme: self.theme.selection().to_string(),
+            theme_background: self.theme_background,
+            update_ms: self.update_ms,
+        }
+        .save()
+    }
+
+    pub fn toggle_help(&mut self) {
+        if self.show_theme_picker {
+            self.cancel_theme_picker();
+        }
+        self.show_help = !self.show_help;
+    }
+
+    pub fn open_theme_picker(&mut self) {
+        self.show_help = false;
+        self.theme_before_picker = self.active_theme_index;
+        self.background_before_picker = self.theme_background;
+        self.picker_theme_index = self.active_theme_index;
+        self.show_theme_picker = true;
+    }
+
+    pub fn theme_count(&self) -> usize {
+        self.theme_catalog.len()
+    }
+
+    pub fn theme_name(&self, index: usize) -> &str {
+        self.theme_catalog.theme(index).name()
+    }
+
+    pub fn theme_at(&self, index: usize) -> &Theme {
+        self.theme_catalog.theme(index)
+    }
+
+    pub fn picker_theme_index(&self) -> usize {
+        self.picker_theme_index
+    }
+
+    pub fn active_theme_index(&self) -> usize {
+        self.active_theme_index
+    }
+
+    pub fn preview_next_theme(&mut self) {
+        self.move_theme_preview(1);
+    }
+
+    pub fn preview_previous_theme(&mut self) {
+        self.move_theme_preview(-1);
+    }
+
+    pub fn move_theme_preview(&mut self, delta: isize) {
+        let len = self.theme_catalog.len();
+        if len == 0 {
+            return;
+        }
+        self.picker_theme_index =
+            (self.picker_theme_index as isize + delta).rem_euclid(len as isize) as usize;
+        self.theme = self.theme_catalog.theme(self.picker_theme_index).clone();
+    }
+
+    pub fn preview_first_theme(&mut self) {
+        self.preview_theme(0);
+    }
+
+    pub fn preview_last_theme(&mut self) {
+        self.preview_theme(self.theme_catalog.len().saturating_sub(1));
+    }
+
+    pub fn toggle_theme_background(&mut self) {
+        self.theme_background = !self.theme_background;
+    }
+
+    pub fn commit_theme_picker(&mut self) -> Result<(), String> {
+        self.active_theme_index = self.picker_theme_index;
+        self.show_theme_picker = false;
+        self.save_preferences()
+    }
+
+    pub fn cancel_theme_picker(&mut self) {
+        self.active_theme_index = self.theme_before_picker;
+        self.picker_theme_index = self.active_theme_index;
+        self.theme = self.theme_catalog.theme(self.active_theme_index).clone();
+        self.theme_background = self.background_before_picker;
+        self.show_theme_picker = false;
+    }
+
+    fn preview_theme(&mut self, index: usize) {
+        if self.theme_catalog.is_empty() {
+            return;
+        }
+        self.picker_theme_index = index.min(self.theme_catalog.len() - 1);
+        self.theme = self.theme_catalog.theme(self.picker_theme_index).clone();
+    }
+
+    pub fn is_paused(&self) -> bool {
+        self.paused
+    }
+
+    pub fn poll(&mut self) {
+        let now = Instant::now();
+        if self.paused || now < self.next_poll {
+            return;
+        }
+        self.last_poll = now;
+
+        let prev = if self.snapshot.connected {
+            Some(self.snapshot.clone())
+        } else {
+            None
+        };
+
+        let snap = api::fetch_snapshot(&self.url, &prev);
+        let mut prompt_history_sample = 0.0;
+
+        // Prompt-processing speed is measured from llama.cpp's cumulative
+        // evaluated-token and active prompt-time counters. Slot snapshots are
+        // unsuitable here: a short prompt can start and finish between polls,
+        // and a task transition resets its per-slot counters.
+        if snap.metrics_available {
+            let update = measured_prompt_rate(&snap.metrics, snap.prev_metrics.as_ref());
+            prompt_history_sample = prompt_chart_sample(update, snap.prev_metrics.is_some());
+            if update.reset {
+                self.prompt_rate = 0.0;
+                self.prompt_rate_basis = PromptRateBasis::Unavailable;
+                self.prompt_rate_history.clear();
+            }
+            if let Some(measurement) = update.measurement {
+                self.prompt_rate = measurement.tokens_per_second;
+                self.prompt_rate_basis = measurement.basis;
+            }
+        }
+
+        // Generation remains a live activity rate from the per-slot decoded
+        // counters, which advance throughout generation.
+        let dt = self
+            .prev_rate_time
+            .map(|t| now.duration_since(t).as_secs_f64())
+            .unwrap_or(0.0);
+
+        if dt > 0.0 {
+            let any_processing = snap.slots.iter().any(|s| s.is_processing);
+
+            if any_processing {
+                let decoded_delta = slot_decoded_delta(&self.prev_slot_counters, &snap.slots);
+
+                // Generation rate: new decoded tokens / time
+                self.predict_rate = decoded_delta as f64 / dt;
+            } else {
+                // No slot is processing — reset rates to 0
+                self.predict_rate = 0.0;
+            }
+        }
+
+        self.prev_slot_counters = snap
+            .slots
+            .iter()
+            .map(|slot| (slot.id, SlotCounters::from(slot)))
+            .collect();
+        self.prev_rate_time = Some(now);
+
+        // Every chart advances on the same universal polling tick. Prompt eval
+        // uses zero for intervals without newly committed prefill work, while
+        // the headline above retains the last measured speed.
+        Self::push_history(&mut self.prompt_rate_history, prompt_history_sample);
+        Self::push_history(&mut self.predict_rate_history, self.predict_rate);
+
+        // GPU averages
+        if !snap.gpus.is_empty() {
+            let avg_util: f64 =
+                snap.gpus.iter().map(|g| g.gpu_util).sum::<f64>() / snap.gpus.len() as f64;
+            let total_power: f64 = snap.gpus.iter().map(|g| g.power_draw).sum();
+            let avg_mem_pct: f64 = snap
+                .gpus
+                .iter()
+                .map(|g| {
+                    if g.mem_total > 0 {
+                        (g.mem_used as f64 / g.mem_total as f64) * 100.0
+                    } else {
+                        0.0
+                    }
+                })
+                .sum::<f64>()
+                / snap.gpus.len() as f64;
+
+            Self::push_history(&mut self.gpu_util_history, avg_util);
+            Self::push_history(&mut self.power_history, total_power);
+            Self::push_history(&mut self.mem_history, avg_mem_pct);
+        }
+
+        if snap.metrics_available {
+            Self::push_history(&mut self.requests_history, snap.metrics.requests_processing);
+            self.total_prompt_tokens = snap.metrics.prompt_tokens_total;
+            self.total_predict_tokens = snap.metrics.tokens_predicted_total;
+        }
+
+        self.snapshot = snap;
+
+        // Keep one cadence for the whole snapshot. If a slow source overruns
+        // an interval, advance to the next future tick instead of issuing a
+        // burst of catch-up polls.
+        let finished = Instant::now();
+        self.next_poll = next_poll_deadline(now, finished, Duration::from_millis(self.update_ms));
+    }
+
+    fn push_history(history: &mut VecDeque<f64>, val: f64) {
+        if history.len() >= MAX_SAMPLES {
+            history.pop_front();
+        }
+        history.push_back(val);
+    }
+
+    pub fn history_as_points(&self, history: &VecDeque<f64>) -> Vec<(f64, f64)> {
+        history
+            .iter()
+            .enumerate()
+            .map(|(i, v)| (i as f64, *v))
+            .collect()
+    }
+
+    pub fn max_history(&self, history: &VecDeque<f64>) -> f64 {
+        let max = history.iter().cloned().fold(0.0f64, f64::max);
+        if max <= 0.0 {
+            return 1.0;
+        }
+        let scaled = max * 1.2;
+        if scaled >= 100.0 {
+            (scaled / 10.0).ceil() * 10.0
+        } else if scaled >= 10.0 {
+            (scaled).ceil()
+        } else {
+            (scaled * 10.0).ceil() / 10.0
+        }
+    }
+
+    pub fn uptime_str(&self) -> String {
+        let d = self.start_time.elapsed();
+        let h = d.as_secs() / 3600;
+        let m = (d.as_secs() % 3600) / 60;
+        let s = d.as_secs() % 60;
+        if h > 0 {
+            format!("{}h {:02}m {:02}s", h, m, s)
+        } else {
+            format!("{:02}m {:02}s", m, s)
+        }
+    }
+}
+
+fn next_poll_deadline(started: Instant, finished: Instant, interval: Duration) -> Instant {
+    let mut deadline = started.checked_add(interval).unwrap_or(finished);
+    while deadline <= finished {
+        let Some(next) = deadline.checked_add(interval) else {
+            return finished;
+        };
+        deadline = next;
+    }
+    deadline
+}
+
+fn evenly_divisible(value: u64, divisor: u64) -> bool {
+    value.checked_rem(divisor) == Some(0)
+}
+
+fn valid_counter(value: f64) -> bool {
+    value.is_finite() && value >= 0.0
+}
+
+fn cumulative_prompt_average(metrics: &Metrics) -> Option<f64> {
+    if !valid_counter(metrics.prompt_tokens_total)
+        || !valid_counter(metrics.prompt_seconds_total)
+        || metrics.prompt_tokens_total <= 0.0
+    {
+        return None;
+    }
+
+    if metrics.prompt_tokens_seconds.is_finite() && metrics.prompt_tokens_seconds > 0.0 {
+        return Some(metrics.prompt_tokens_seconds);
+    }
+
+    if metrics.prompt_seconds_total > 0.0 {
+        let rate = metrics.prompt_tokens_total / metrics.prompt_seconds_total;
+        if rate.is_finite() && rate > 0.0 {
+            return Some(rate);
+        }
+    }
+
+    None
+}
+
+/// Converts a prompt measurement into activity for the current chart tick.
+/// An initial scrape may supply a historical server average for the headline,
+/// but only a delta against a previous scrape belongs on the live timeline.
+fn prompt_chart_sample(update: PromptRateUpdate, has_previous_metrics: bool) -> f64 {
+    if !has_previous_metrics {
+        return 0.0;
+    }
+
+    update
+        .measurement
+        .map_or(0.0, |measurement| measurement.tokens_per_second)
+}
+
+/// Returns a server-timed prompt-evaluation measurement when new prompt work
+/// has been committed to `/metrics`. The delta uses active prompt-processing
+/// seconds rather than scrape wall time, so idle time and HTTP latency cannot
+/// distort the value.
+fn measured_prompt_rate(current: &Metrics, previous: Option<&Metrics>) -> PromptRateUpdate {
+    if !valid_counter(current.prompt_tokens_total) || !valid_counter(current.prompt_seconds_total) {
+        return PromptRateUpdate::default();
+    }
+
+    let Some(previous) = previous else {
+        return PromptRateUpdate {
+            measurement: cumulative_prompt_average(current).map(|tokens_per_second| {
+                PromptRateMeasurement {
+                    tokens_per_second,
+                    basis: PromptRateBasis::ServerAverage,
+                }
+            }),
+            reset: false,
+        };
+    };
+
+    if !valid_counter(previous.prompt_tokens_total) || !valid_counter(previous.prompt_seconds_total)
+    {
+        return PromptRateUpdate {
+            measurement: cumulative_prompt_average(current).map(|tokens_per_second| {
+                PromptRateMeasurement {
+                    tokens_per_second,
+                    basis: PromptRateBasis::ServerAverage,
+                }
+            }),
+            reset: false,
+        };
+    }
+
+    let reset = current.prompt_tokens_total < previous.prompt_tokens_total
+        || current.prompt_seconds_total < previous.prompt_seconds_total;
+    if reset {
+        return PromptRateUpdate {
+            measurement: cumulative_prompt_average(current).map(|tokens_per_second| {
+                PromptRateMeasurement {
+                    tokens_per_second,
+                    basis: PromptRateBasis::ServerAverage,
+                }
+            }),
+            reset: true,
+        };
+    }
+
+    let token_delta = current.prompt_tokens_total - previous.prompt_tokens_total;
+    if token_delta <= 0.0 {
+        return PromptRateUpdate::default();
+    }
+
+    let seconds_delta = current.prompt_seconds_total - previous.prompt_seconds_total;
+    let measurement = if seconds_delta > 0.0 {
+        let rate = token_delta / seconds_delta;
+        (rate.is_finite() && rate > 0.0).then_some(PromptRateMeasurement {
+            tokens_per_second: rate,
+            basis: PromptRateBasis::Interval,
+        })
+    } else {
+        // Millisecond serialization can round a very short prompt's cumulative
+        // time to the same value. llama.cpp's own gauge retains the precise
+        // internal timing and is the honest fallback in that case.
+        cumulative_prompt_average(current).map(|tokens_per_second| PromptRateMeasurement {
+            tokens_per_second,
+            basis: PromptRateBasis::ServerAverage,
+        })
+    };
+
+    PromptRateUpdate {
+        measurement,
+        reset: false,
+    }
+}
+
+fn slot_decoded_delta(previous: &HashMap<i64, SlotCounters>, slots: &[SlotInfo]) -> i64 {
+    slots
+        .iter()
+        .filter(|slot| slot.is_processing)
+        .filter_map(|slot| {
+            let before = previous.get(&slot.id)?;
+            let current = SlotCounters::from(slot);
+
+            // A counter reset identifies a new request. When llama.cpp exposes
+            // task IDs, also skip the transition sample so old and new work is
+            // never combined into one rate.
+            if before.task_id != current.task_id {
+                return None;
+            }
+
+            Some((current.decoded_tokens - before.decoded_tokens).max(0))
+        })
+        .sum()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn slot(id: i64, task_id: i64, decoded_tokens: i64) -> SlotInfo {
+        SlotInfo {
+            id,
+            task_id: Some(task_id),
+            is_processing: true,
+            decoded_tokens,
+            ..SlotInfo::default()
+        }
+    }
+
+    #[test]
+    fn generation_slot_resets_do_not_cancel_progress_in_other_slots() {
+        let previous = HashMap::from([
+            (0, SlotCounters::from(&slot(0, 7, 20))),
+            (1, SlotCounters::from(&slot(1, 8, 40))),
+        ]);
+        let current = vec![slot(0, 9, 1), slot(1, 8, 46)];
+
+        assert_eq!(slot_decoded_delta(&previous, &current), 6);
+    }
+
+    #[test]
+    fn generation_changed_task_is_ignored_for_its_transition_sample() {
+        let previous = HashMap::from([(0, SlotCounters::from(&slot(0, 7, 20)))]);
+        let current = vec![slot(0, 8, 22)];
+
+        assert_eq!(slot_decoded_delta(&previous, &current), 0);
+    }
+
+    fn prompt_metrics(tokens: f64, seconds: f64, server_average: f64) -> Metrics {
+        Metrics {
+            prompt_tokens_total: tokens,
+            prompt_seconds_total: seconds,
+            prompt_tokens_seconds: server_average,
+            ..Metrics::default()
+        }
+    }
+
+    #[test]
+    fn prompt_rate_uses_server_processing_time_not_poll_time() {
+        let previous = prompt_metrics(1_000.0, 2.0, 500.0);
+        let current = prompt_metrics(1_300.0, 2.75, 472.7);
+
+        assert_eq!(
+            measured_prompt_rate(&current, Some(&previous)),
+            PromptRateUpdate {
+                measurement: Some(PromptRateMeasurement {
+                    tokens_per_second: 400.0,
+                    basis: PromptRateBasis::Interval,
+                }),
+                reset: false,
+            }
+        );
+    }
+
+    #[test]
+    fn idle_scrapes_do_not_invent_prompt_measurements() {
+        let metrics = prompt_metrics(1_300.0, 2.75, 472.7);
+
+        assert_eq!(
+            measured_prompt_rate(&metrics, Some(&metrics)),
+            PromptRateUpdate::default()
+        );
+    }
+
+    #[test]
+    fn prompt_chart_advances_with_zero_during_idle_polls() {
+        let metrics = prompt_metrics(1_300.0, 2.75, 472.7);
+        let idle_update = measured_prompt_rate(&metrics, Some(&metrics));
+        let mut history = VecDeque::from([400.0]);
+
+        App::push_history(&mut history, prompt_chart_sample(idle_update, true));
+
+        assert_eq!(history, VecDeque::from([400.0, 0.0]));
+    }
+
+    #[test]
+    fn initial_server_average_is_a_headline_not_current_activity() {
+        let current = prompt_metrics(1_300.0, 2.75, 472.7);
+        let initial_update = measured_prompt_rate(&current, None);
+
+        assert_eq!(prompt_chart_sample(initial_update, false), 0.0);
+        assert_eq!(
+            initial_update.measurement,
+            Some(PromptRateMeasurement {
+                tokens_per_second: 472.7,
+                basis: PromptRateBasis::ServerAverage,
+            })
+        );
+    }
+
+    #[test]
+    fn first_scrape_uses_llama_server_average_when_history_exists() {
+        let current = prompt_metrics(1_300.0, 2.75, 472.7);
+
+        assert_eq!(
+            measured_prompt_rate(&current, None),
+            PromptRateUpdate {
+                measurement: Some(PromptRateMeasurement {
+                    tokens_per_second: 472.7,
+                    basis: PromptRateBasis::ServerAverage,
+                }),
+                reset: false,
+            }
+        );
+    }
+
+    #[test]
+    fn sub_millisecond_counter_rounding_uses_server_gauge() {
+        let previous = prompt_metrics(1_000.0, 2.0, 500.0);
+        let current = prompt_metrics(1_001.0, 2.0, 625.0);
+
+        assert_eq!(
+            measured_prompt_rate(&current, Some(&previous)),
+            PromptRateUpdate {
+                measurement: Some(PromptRateMeasurement {
+                    tokens_per_second: 625.0,
+                    basis: PromptRateBasis::ServerAverage,
+                }),
+                reset: false,
+            }
+        );
+    }
+
+    #[test]
+    fn server_counter_reset_clears_the_previous_prompt_session() {
+        let previous = prompt_metrics(1_000.0, 2.0, 500.0);
+        let current = prompt_metrics(0.0, 0.0, 0.0);
+
+        assert_eq!(
+            measured_prompt_rate(&current, Some(&previous)),
+            PromptRateUpdate {
+                measurement: None,
+                reset: true,
+            }
+        );
+    }
+
+    #[test]
+    fn malformed_prompt_counters_are_ignored() {
+        let previous = prompt_metrics(1_000.0, 2.0, 500.0);
+        let current = prompt_metrics(f64::NAN, 3.0, 500.0);
+
+        assert_eq!(
+            measured_prompt_rate(&current, Some(&previous)),
+            PromptRateUpdate::default()
+        );
+    }
+
+    #[test]
+    fn the_initial_poll_is_not_throttled() {
+        let app = App::new("http://localhost:8080".to_string());
+
+        assert_eq!(app.poll_wait(), Duration::ZERO);
+    }
+
+    #[test]
+    fn one_deadline_skips_missed_ticks_without_catch_up_bursts() {
+        let started = Instant::now();
+        let finished = started + Duration::from_millis(2_500);
+
+        assert_eq!(
+            next_poll_deadline(started, finished, Duration::from_secs(1)),
+            started + Duration::from_secs(3)
+        );
+    }
+
+    #[test]
+    fn update_interval_labels_stay_compact() {
+        let milliseconds = App::with_update_ms("http://localhost:8080".to_string(), 750);
+        let seconds = App::with_update_ms("http://localhost:8080".to_string(), 2_000);
+        let fractional = App::with_update_ms("http://localhost:8080".to_string(), 1_500);
+        let day = App::with_update_ms("http://localhost:8080".to_string(), MAX_UPDATE_MS);
+
+        assert_eq!(milliseconds.update_interval_label(), "750ms");
+        assert_eq!(seconds.update_interval_label(), "2s");
+        assert_eq!(fractional.update_interval_label(), "1.5s");
+        assert_eq!(day.update_interval_label(), "24h");
+    }
+
+    #[test]
+    fn cancelling_the_theme_picker_restores_the_applied_theme() {
+        let mut app = App::new("http://localhost:8080".to_string());
+        let original = app.theme.name().to_string();
+
+        app.open_theme_picker();
+        app.preview_next_theme();
+        app.toggle_theme_background();
+        assert_ne!(app.theme.name(), original);
+        assert!(!app.theme_background);
+        app.cancel_theme_picker();
+
+        assert_eq!(app.theme.name(), original);
+        assert!(app.theme_background);
+        assert!(!app.show_theme_picker);
+    }
+}
