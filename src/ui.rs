@@ -1,5 +1,5 @@
 use crate::api::GpuInfo;
-use crate::app::{App, PromptRateBasis, Section};
+use crate::app::{App, PromptRateBasis, Section, MAX_SAMPLES};
 use crate::chart::BrailleChart;
 use crate::theme::{Gradient, ThemeColors};
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
@@ -372,6 +372,7 @@ fn draw_throughput_chart(frame: &mut Frame, area: Rect, app: &App, prompt: bool,
             gradient,
             app.theme.graph_text,
         )
+        .history_capacity(MAX_SAMPLES)
         .block(block),
         area,
     );
@@ -394,7 +395,9 @@ fn draw_gpu_chart(frame: &mut Frame, area: Rect, app: &App, focused: bool) {
         colors,
     );
     frame.render_widget(
-        BrailleChart::new(&data, 100.0, &app.theme.gpu, app.theme.graph_text).block(block),
+        BrailleChart::new(&data, 100.0, &app.theme.gpu, app.theme.graph_text)
+            .history_capacity(MAX_SAMPLES)
+            .block(block),
         area,
     );
 }
@@ -417,7 +420,9 @@ fn draw_power_chart(frame: &mut Frame, area: Rect, app: &App, focused: bool) {
         colors,
     );
     frame.render_widget(
-        BrailleChart::new(&data, max, &app.theme.power, app.theme.graph_text).block(block),
+        BrailleChart::new(&data, max, &app.theme.power, app.theme.graph_text)
+            .history_capacity(MAX_SAMPLES)
+            .block(block),
         area,
     );
 }
@@ -1967,6 +1972,37 @@ mod tests {
 
         assert!(output.contains("tok/s avg"));
         assert!(!output.contains("tok/s last"));
+    }
+
+    #[test]
+    fn saturated_generate_history_reaches_the_left_edge_of_a_focused_chart() {
+        let mut app = demo_app();
+        app.current_section = Section::Throughput;
+        app.predict_rate_history.clear();
+        app.predict_rate_history
+            .extend(std::iter::repeat_n(50.0, MAX_SAMPLES));
+        let output = render(&app, 80, 24);
+        let lines: Vec<&str> = output.lines().collect();
+        let title_row = lines
+            .iter()
+            .position(|line| line.contains("GENERATE"))
+            .expect("generate chart title");
+        let border_row = lines
+            .iter()
+            .enumerate()
+            .skip(title_row + 1)
+            .find_map(|(index, line)| line.starts_with('╰').then_some(index))
+            .expect("generate chart bottom border");
+        let graph = lines[border_row - 1]
+            .split_once("0.0 ")
+            .expect("bottom-axis label")
+            .1;
+        let first_graph_cell = graph.chars().next().expect("graph content");
+
+        assert!(
+            ('\u{2800}'..='\u{28ff}').contains(&first_graph_cell),
+            "expected history at the left edge, got {first_graph_cell:?}"
+        );
     }
 
     #[test]

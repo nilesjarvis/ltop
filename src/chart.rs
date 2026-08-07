@@ -24,6 +24,7 @@ pub struct BrailleChart<'a> {
     graph_text: Color,
     block: Option<Block<'a>>,
     fill: bool,
+    history_capacity: Option<usize>,
 }
 
 impl<'a> BrailleChart<'a> {
@@ -40,6 +41,7 @@ impl<'a> BrailleChart<'a> {
             graph_text,
             block: None,
             fill: true,
+            history_capacity: None,
         }
     }
 
@@ -50,6 +52,14 @@ impl<'a> BrailleChart<'a> {
 
     pub fn fill(mut self, fill: bool) -> Self {
         self.fill = fill;
+        self
+    }
+
+    /// Defines the number of samples represented by the full chart width.
+    /// Partial histories grow in from the right; a complete history is
+    /// resampled across the whole viewport regardless of terminal width.
+    pub fn history_capacity(mut self, capacity: usize) -> Self {
+        self.history_capacity = (capacity > 0).then_some(capacity);
         self
     }
 }
@@ -101,27 +111,17 @@ impl Widget for BrailleChart<'_> {
         let grid_height = graph_area.height as usize * 4;
         let mut grid = vec![vec![false; grid_width]; grid_height];
 
-        // Use the most recent samples and right-align short histories. This
-        // gives the graph a stable "now" edge while samples accumulate.
-        let sample_count = self.data.len();
-        if sample_count <= grid_width {
-            let offset = grid_width - sample_count;
-            let mut previous_y = None;
-            for (index, (_, value)) in self.data.iter().enumerate() {
-                let column = offset + index;
-                let y = value_to_y(*value, max, grid_height);
-                plot_column(&mut grid, column, y, previous_y, grid_height, self.fill);
-                previous_y = Some(y);
-            }
-        } else {
-            let step = sample_count as f64 / grid_width as f64;
-            let mut previous_y = None;
-            for column in 0..grid_width {
-                let index = ((column as f64 * step) as usize).min(sample_count - 1);
-                let y = value_to_y(self.data[index].1, max, grid_height);
-                plot_column(&mut grid, column, y, previous_y, grid_height, self.fill);
-                previous_y = Some(y);
-            }
+        // Keep "now" pinned to the right. A known history capacity also gives
+        // the graph a stable time window: partial histories occupy the same
+        // fraction of the viewport as the fraction collected, and a saturated
+        // history always reaches the left edge on terminals of any width.
+        let mut previous_y = None;
+        for (column, sample_index) in
+            sampled_columns(self.data.len(), grid_width, self.history_capacity)
+        {
+            let y = value_to_y(self.data[sample_index].1, max, grid_height);
+            plot_column(&mut grid, column, y, previous_y, grid_height, self.fill);
+            previous_y = Some(y);
         }
 
         for cell_y in 0..graph_area.height as usize {
@@ -151,6 +151,44 @@ impl Widget for BrailleChart<'_> {
             }
         }
     }
+}
+
+fn sampled_columns(
+    sample_count: usize,
+    grid_width: usize,
+    history_capacity: Option<usize>,
+) -> Vec<(usize, usize)> {
+    if sample_count == 0 || grid_width == 0 {
+        return Vec::new();
+    }
+
+    let occupied_width = history_capacity
+        .filter(|capacity| *capacity > 0)
+        .map(|capacity| {
+            let retained = sample_count.min(capacity);
+            grid_width
+                .saturating_mul(retained)
+                .saturating_add(capacity - 1)
+                / capacity
+        })
+        .unwrap_or_else(|| sample_count.min(grid_width))
+        .clamp(1, grid_width);
+    let offset = grid_width - occupied_width;
+
+    (0..occupied_width)
+        .map(|local_column| {
+            let sample_index = if occupied_width == 1 || sample_count == 1 {
+                sample_count - 1
+            } else {
+                let denominator = occupied_width - 1;
+                local_column
+                    .saturating_mul(sample_count - 1)
+                    .saturating_add(denominator / 2)
+                    / denominator
+            };
+            (offset + local_column, sample_index.min(sample_count - 1))
+        })
+        .collect()
 }
 
 fn value_to_y(value: f64, max: f64, grid_height: usize) -> usize {
@@ -271,5 +309,32 @@ mod tests {
         assert_eq!(row_gradient_percent(0, 5), 100.0);
         assert_eq!(row_gradient_percent(2, 5), 50.0);
         assert_eq!(row_gradient_percent(4, 5), 0.0);
+    }
+
+    #[test]
+    fn partial_history_grows_proportionally_from_the_right() {
+        let columns = sampled_columns(60, 140, Some(120));
+
+        assert_eq!(columns.len(), 70);
+        assert_eq!(columns.first(), Some(&(70, 0)));
+        assert_eq!(columns.last(), Some(&(139, 59)));
+    }
+
+    #[test]
+    fn saturated_history_uses_the_full_available_width() {
+        let columns = sampled_columns(120, 140, Some(120));
+
+        assert_eq!(columns.len(), 140);
+        assert_eq!(columns.first(), Some(&(0, 0)));
+        assert_eq!(columns.last(), Some(&(139, 119)));
+    }
+
+    #[test]
+    fn resampling_keeps_the_oldest_and_newest_visible() {
+        let columns = sampled_columns(200, 40, None);
+
+        assert_eq!(columns.len(), 40);
+        assert_eq!(columns.first(), Some(&(0, 0)));
+        assert_eq!(columns.last(), Some(&(39, 199)));
     }
 }
