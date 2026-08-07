@@ -1,13 +1,20 @@
 #![allow(dead_code)]
-use crate::api::{self, Metrics, SlotInfo, Snapshot};
+use crate::api::{Metrics, SlotInfo, Snapshot};
+use crate::collect::Collector;
 use crate::theme::{
     validate_update_ms, Theme, ThemeCatalog, ThemePreferences, DEFAULT_UPDATE_MS, MAX_UPDATE_MS,
     MIN_UPDATE_MS,
 };
 use std::collections::{HashMap, VecDeque};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 pub const MAX_SAMPLES: usize = 120;
+
+/// How long the UI waits between checks for a fresh snapshot when the collector
+/// has not produced one yet. Small enough to stay responsive, large enough to
+/// avoid a hot loop.
+const COLLECTOR_POLL_BACKOFF: Duration = Duration::from_millis(100);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct SlotCounters {
@@ -118,6 +125,11 @@ pub struct App {
     prev_slot_counters: HashMap<i64, SlotCounters>,
     prev_rate_time: Option<Instant>,
     next_poll: Instant,
+    // Background snapshot provider. All network/GPU work happens off the UI
+    // thread so drawing and key handling never block on the server.
+    collector: Arc<Collector>,
+    // Generation of the newest snapshot we have incorporated into `snapshot`.
+    applied_generation: u64,
 }
 
 impl App {
@@ -161,6 +173,7 @@ impl App {
         let update_ms = update_ms.clamp(MIN_UPDATE_MS, MAX_UPDATE_MS);
         let active_theme_index = active_theme_index.min(theme_catalog.len().saturating_sub(1));
         let theme = theme_catalog.theme(active_theme_index).clone();
+        let collector = Arc::new(Collector::new(url.clone(), update_ms));
         Self {
             url,
             snapshot: Snapshot::new(),
@@ -195,6 +208,8 @@ impl App {
             prev_rate_time: None,
             // The first collection is due immediately, before the first draw.
             next_poll: now,
+            collector,
+            applied_generation: 0,
         }
     }
 
@@ -229,6 +244,9 @@ impl App {
 
     pub fn toggle_pause(&mut self) {
         self.paused = !self.paused;
+        // Keep the background collector in sync so it stops hammering the
+        // server (and spending effort) while the UI is frozen.
+        self.collector.set_paused(self.paused);
         if !self.paused {
             // Resume with a fresh universal snapshot. Slot counters cannot be
             // divided by time spent paused without producing a false rate.
@@ -243,6 +261,18 @@ impl App {
             return Duration::from_secs(1);
         }
         self.next_poll.saturating_duration_since(Instant::now())
+    }
+
+    /// Start the background snapshot collector. Call once from the event loop
+    /// before rendering. Returns the collection thread's join handle.
+    pub fn start_collection(&self) -> std::thread::JoinHandle<()> {
+        self.collector.start()
+    }
+
+    /// Ask the background collector to wind down. Asynchronous: it only takes
+    /// effect between collection cycles and never waits on an in-flight fetch.
+    pub fn stop_collection(&self) {
+        self.collector.stop();
     }
 
     pub fn update_interval_label(&self) -> String {
@@ -290,6 +320,7 @@ impl App {
 
     fn set_update_interval(&mut self, update_ms: u64) -> Result<(), String> {
         self.update_ms = validate_update_ms(update_ms)?;
+        self.collector.set_update_ms(self.update_ms);
         self.next_poll = Instant::now()
             .checked_add(Duration::from_millis(self.update_ms))
             .unwrap_or_else(Instant::now);
@@ -396,20 +427,29 @@ impl App {
         self.paused
     }
 
-    pub fn poll(&mut self) {
+    /// Fold the newest snapshot produced by the background collector into the
+    /// running charts.
+    ///
+    /// This never performs I/O and therefore never blocks the UI thread: it
+    /// reads whatever snapshot the [`Collector`] already fetched and folds it
+    /// into the histories. Returns `true` when a fresh snapshot was applied.
+    pub fn poll(&mut self) -> bool {
         let now = Instant::now();
-        if self.paused || now < self.next_poll {
-            return;
+        if self.paused {
+            return false;
         }
+
+        // The collector has not produced anything newer than what we last
+        // applied. Schedule a short re-check so the loop wakes up as soon as a
+        // snapshot lands instead of spinning on a zero-duration input wait.
+        let Some((snap, generation)) = self.collector.take_newer_than(self.applied_generation)
+        else {
+            self.next_poll = now.checked_add(COLLECTOR_POLL_BACKOFF).unwrap_or(now);
+            return false;
+        };
+        self.applied_generation = generation;
         self.last_poll = now;
 
-        let prev = if self.snapshot.connected {
-            Some(self.snapshot.clone())
-        } else {
-            None
-        };
-
-        let snap = api::fetch_snapshot(&self.url, &prev);
         let mut prompt_history_sample = 0.0;
 
         // Prompt-processing speed is measured from llama.cpp's cumulative
@@ -500,6 +540,7 @@ impl App {
         // burst of catch-up polls.
         let finished = Instant::now();
         self.next_poll = next_poll_deadline(now, finished, Duration::from_millis(self.update_ms));
+        true
     }
 
     fn push_history(history: &mut VecDeque<f64>, val: f64) {
@@ -545,7 +586,11 @@ impl App {
     }
 }
 
-fn next_poll_deadline(started: Instant, finished: Instant, interval: Duration) -> Instant {
+pub(crate) fn next_poll_deadline(
+    started: Instant,
+    finished: Instant,
+    interval: Duration,
+) -> Instant {
     let mut deadline = started.checked_add(interval).unwrap_or(finished);
     while deadline <= finished {
         let Some(next) = deadline.checked_add(interval) else {
@@ -897,6 +942,56 @@ mod tests {
         assert_eq!(seconds.update_interval_label(), "2s");
         assert_eq!(fractional.update_interval_label(), "1.5s");
         assert_eq!(day.update_interval_label(), "24h");
+    }
+
+    #[test]
+    fn poll_does_not_block_on_a_slow_server() {
+        use std::io::Read;
+        use std::time::Duration as D;
+
+        // A server thread that takes 500ms to answer every request, so any
+        // blocking collection would measurably stall the UI thread.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                std::thread::spawn(move || {
+                    let _ = stream.try_clone().map(|mut c| {
+                        let mut buf = [0u8; 512];
+                        let _ = c.read(&mut buf);
+                    });
+                    std::thread::sleep(D::from_millis(500));
+                    let _ = write_ok(stream);
+                });
+            }
+        });
+
+        let mut app = App::with_update_ms(format!("http://127.0.0.1:{port}"), 100);
+        let _handle = app.start_collection();
+        // Let the collector begin its first (slow) fetch in the background.
+        std::thread::sleep(D::from_millis(30));
+
+        let start = std::time::Instant::now();
+        for _ in 0..10 {
+            app.poll();
+        }
+        let elapsed = start.elapsed();
+        app.stop_collection();
+        drop(_handle);
+
+        assert!(
+            elapsed < D::from_millis(200),
+            "poll() blocked on the server for {elapsed:?}"
+        );
+
+        fn write_ok(mut stream: std::net::TcpStream) -> std::io::Result<()> {
+            use std::io::Write as _;
+            let body = br#"{"error":{"message":"x"}}"#;
+            stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: ")?;
+            stream.write_all(body.len().to_string().as_bytes())?;
+            stream.write_all(b"\r\n\r\n")?;
+            stream.write_all(body)
+        }
     }
 
     #[test]

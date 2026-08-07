@@ -5,6 +5,7 @@ use std::time::Duration;
 mod api;
 mod app;
 mod chart;
+mod collect;
 mod theme;
 mod ui;
 
@@ -234,7 +235,11 @@ fn run(
     use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers};
 
     let mut configuration_warning = None;
-    app.poll();
+
+    // Data collection runs on its own thread so the UI never blocks on network
+    // I/O or nvidia-smi. `poll()` below just reads whatever snapshot the
+    // collector has produced, making key handling and the theme picker snappy.
+    let collector_thread = app.start_collection();
 
     loop {
         terminal.draw(|frame| ui::draw(frame, &app))?;
@@ -311,6 +316,11 @@ fn run(
 
         app.poll();
     }
+
+    // Wind down the collector. The UI loop has already exited; we give the
+    // thread a chance to notice the stop but never wait on an in-flight fetch.
+    app.stop_collection();
+    let _ = collector_thread;
 
     Ok(configuration_warning)
 }
