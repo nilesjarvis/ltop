@@ -3,6 +3,7 @@
 mod api;
 mod app;
 mod chart;
+mod collect;
 mod theme;
 mod ui;
 
@@ -11,6 +12,10 @@ fn main() {
     // Keep the headless fixture quick while exercising the same universal
     // cadence used by the interactive app.
     let mut app = app::App::with_update_ms(url, 500);
+
+    // Data is fetched on a background thread; start it so poll() has
+    // snapshots to fold into history.
+    let _collector = app.start_collection();
 
     // Poll several times to build up history
     for _ in 0..15 {
