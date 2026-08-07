@@ -29,6 +29,10 @@ const TICK: Duration = Duration::from_millis(100);
 struct State {
     snapshot: Option<Snapshot>,
     produced: u64,
+    // Incremented whenever collection crosses a pause boundary. A fetch keeps
+    // the epoch it started in and may only publish into that same epoch, which
+    // prevents a pre-pause request from becoming the post-resume rate baseline.
+    epoch: u64,
 }
 
 /// Shared, thread-safe snapshot collector.
@@ -58,6 +62,7 @@ impl Collector {
             state: Arc::new(Mutex::new(State {
                 snapshot: None,
                 produced: 0,
+                epoch: 0,
             })),
         }
     }
@@ -74,7 +79,11 @@ impl Collector {
 
     /// Change the collection cadence for the background thread.
     pub fn set_update_ms(&self, update_ms: u64) {
-        self.update_ms.store(update_ms, Ordering::Relaxed);
+        self.update_ms.store(update_ms, Ordering::Release);
+        // The existing deadline was calculated from the old cadence and may be
+        // minutes or hours away. Invalidate it so the new cadence takes effect
+        // immediately instead of waiting for that stale deadline.
+        self.wakeup.store(true, Ordering::Release);
     }
 
     /// Pause/unpause background collection. Paused collection stops issuing
@@ -85,7 +94,19 @@ impl Collector {
     /// deadline that was scheduled while paused.
     pub fn set_paused(&self, paused: bool) {
         let was_paused = self.paused.swap(paused, Ordering::AcqRel);
-        if was_paused && !paused {
+        if was_paused == paused {
+            return;
+        }
+
+        // A request already in flight cannot be cancelled. Advancing the epoch
+        // both discards any pending snapshot and prevents that request from
+        // publishing after a pause/resume transition.
+        let mut state = self.state.lock().unwrap();
+        state.epoch = state.epoch.wrapping_add(1);
+        state.snapshot = None;
+        drop(state);
+
+        if !paused {
             self.wakeup.store(true, Ordering::Release);
         }
     }
@@ -111,10 +132,20 @@ impl Collector {
             .map(|snapshot| (snapshot, produced))
     }
 
-    fn publish(&self, snapshot: Snapshot) {
+    fn current_epoch(&self) -> u64 {
+        self.state.lock().unwrap().epoch
+    }
+
+    /// Publish only if the collection cycle still belongs to the current
+    /// pause epoch. Returns whether the snapshot became visible to the UI.
+    fn publish(&self, snapshot: Snapshot, epoch: u64) -> bool {
         let mut state = self.state.lock().unwrap();
+        if self.paused.load(Ordering::Acquire) || state.epoch != epoch {
+            return false;
+        }
         state.snapshot = Some(snapshot);
         state.produced = state.produced.wrapping_add(1);
+        true
     }
 
     fn run_loop(&self) {
@@ -140,10 +171,12 @@ impl Collector {
 
             let interval = Duration::from_millis(self.update_ms.load(Ordering::Relaxed));
             let started = now;
+            let epoch = self.current_epoch();
             if !self.paused.load(Ordering::Relaxed) {
                 let snapshot = api::fetch_snapshot(&self.url, &previous);
-                self.publish(snapshot.clone());
-                previous = Some(snapshot);
+                if self.publish(snapshot.clone(), epoch) {
+                    previous = Some(snapshot);
+                }
             }
             let finished = Instant::now();
 
@@ -168,7 +201,8 @@ mod tests {
         // Nothing produced yet.
         assert!(collector.take_newer_than(0).is_none());
 
-        collector.publish(Snapshot::new());
+        let epoch = collector.current_epoch();
+        assert!(collector.publish(Snapshot::new(), epoch));
 
         let generation = collector.take_newer_than(0).map(|(_, g)| g).unwrap();
         assert_eq!(generation, 1);
@@ -176,7 +210,7 @@ mod tests {
         assert!(collector.take_newer_than(generation).is_none());
 
         // A later publication bumps the generation and is visible again.
-        collector.publish(Snapshot::new());
+        assert!(collector.publish(Snapshot::new(), epoch));
         assert!(collector.take_newer_than(generation).is_some());
     }
 
@@ -189,6 +223,41 @@ mod tests {
 
         assert_eq!(collector.update_ms.load(Ordering::Relaxed), 500);
         assert!(collector.paused.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn interval_changes_invalidate_the_old_deadline() {
+        let collector = Collector::new("http://localhost:8080".to_string(), 1000);
+
+        collector.set_update_ms(500);
+
+        assert_eq!(collector.update_ms.load(Ordering::Acquire), 500);
+        assert!(collector.wakeup.swap(false, Ordering::AcqRel));
+        assert!(!collector.wakeup.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn pause_boundaries_discard_pending_and_inflight_snapshots() {
+        let collector = Collector::new("http://localhost:8080".to_string(), 1000);
+        let pre_pause_epoch = collector.current_epoch();
+
+        // Model a completed snapshot that the UI has not consumed yet.
+        assert!(collector.publish(Snapshot::new(), pre_pause_epoch));
+        assert!(collector.take_newer_than(0).is_some());
+
+        collector.set_paused(true);
+        assert!(collector.take_newer_than(0).is_none());
+        collector.set_paused(false);
+
+        // Model a slow request that began before pausing and only completed
+        // after resuming. It must not become the new generation-rate baseline.
+        assert!(!collector.publish(Snapshot::new(), pre_pause_epoch));
+        assert!(collector.take_newer_than(0).is_none());
+
+        let post_resume_epoch = collector.current_epoch();
+        assert_ne!(post_resume_epoch, pre_pause_epoch);
+        assert!(collector.publish(Snapshot::new(), post_resume_epoch));
+        assert!(collector.take_newer_than(0).is_some());
     }
 
     #[test]

@@ -1,6 +1,6 @@
 #![allow(dead_code)]
-use crate::collect::Collector;
 use crate::api::{Metrics, SlotInfo, Snapshot};
+use crate::collect::Collector;
 use crate::theme::{
     validate_update_ms, Theme, ThemeCatalog, ThemePreferences, DEFAULT_UPDATE_MS, MAX_UPDATE_MS,
     MIN_UPDATE_MS,
@@ -987,9 +987,7 @@ mod tests {
         fn write_ok(mut stream: std::net::TcpStream) -> std::io::Result<()> {
             use std::io::Write as _;
             let body = br#"{"error":{"message":"x"}}"#;
-            stream.write_all(
-                b"HTTP/1.1 200 OK\r\nContent-Length: ",
-            )?;
+            stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: ")?;
             stream.write_all(body.len().to_string().as_bytes())?;
             stream.write_all(b"\r\n\r\n")?;
             stream.write_all(body)
