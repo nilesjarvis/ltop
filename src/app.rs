@@ -586,7 +586,11 @@ impl App {
     }
 }
 
-fn next_poll_deadline(started: Instant, finished: Instant, interval: Duration) -> Instant {
+pub(crate) fn next_poll_deadline(
+    started: Instant,
+    finished: Instant,
+    interval: Duration,
+) -> Instant {
     let mut deadline = started.checked_add(interval).unwrap_or(finished);
     while deadline <= finished {
         let Some(next) = deadline.checked_add(interval) else {
