@@ -5,7 +5,7 @@ use crate::theme::{
     validate_update_ms, Theme, ThemeCatalog, ThemePreferences, DEFAULT_UPDATE_MS, MAX_UPDATE_MS,
     MIN_UPDATE_MS,
 };
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -28,6 +28,95 @@ impl From<&SlotInfo> for SlotCounters {
             task_id: slot.task_id,
             decoded_tokens: slot.decoded_tokens,
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CacheTotals {
+    pub requests: u64,
+    pub reused_tokens: u64,
+    pub evaluated_tokens: u64,
+}
+
+impl CacheTotals {
+    pub fn input_tokens(&self) -> u64 {
+        self.reused_tokens.saturating_add(self.evaluated_tokens)
+    }
+
+    pub fn reuse_percent(&self) -> f64 {
+        let input = self.input_tokens();
+        if input == 0 {
+            0.0
+        } else {
+            self.reused_tokens as f64 / input as f64 * 100.0
+        }
+    }
+
+    fn include(&mut self, request: &CacheRequestObservation) {
+        self.requests = self.requests.saturating_add(1);
+        self.reused_tokens = self.reused_tokens.saturating_add(request.reused_tokens);
+        self.evaluated_tokens = self
+            .evaluated_tokens
+            .saturating_add(request.evaluated_tokens);
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CacheRequestObservation {
+    pub slot_id: i64,
+    pub task_id: Option<i64>,
+    pub reused_tokens: u64,
+    pub evaluated_tokens: u64,
+    pub context_tokens: u64,
+    pub context_capacity: u64,
+    pub output_tokens: u64,
+    pub phase: &'static str,
+    pub last_seen: Instant,
+}
+
+impl CacheRequestObservation {
+    fn from_slot(slot: &SlotInfo, now: Instant) -> Self {
+        Self {
+            slot_id: slot.id,
+            task_id: slot.task_id,
+            reused_tokens: slot.prompt_tokens_cached.max(0) as u64,
+            evaluated_tokens: slot.prompt_tokens_processed.max(0) as u64,
+            context_tokens: slot.context_tokens.max(0) as u64,
+            context_capacity: slot.context_capacity.max(0) as u64,
+            output_tokens: slot.current_output_tokens().max(0) as u64,
+            phase: slot.phase(),
+            last_seen: now,
+        }
+    }
+
+    pub fn input_tokens(&self) -> u64 {
+        self.reused_tokens.saturating_add(self.evaluated_tokens)
+    }
+
+    pub fn reuse_percent(&self) -> f64 {
+        let input = self.input_tokens();
+        if input == 0 {
+            0.0
+        } else {
+            self.reused_tokens as f64 / input as f64 * 100.0
+        }
+    }
+
+    pub fn context_headroom(&self) -> Option<u64> {
+        (self.context_capacity > 0)
+            .then(|| self.context_capacity.saturating_sub(self.context_tokens))
+    }
+
+    pub fn context_percent(&self) -> f64 {
+        if self.context_capacity == 0 {
+            0.0
+        } else {
+            self.context_tokens as f64 / self.context_capacity as f64 * 100.0
+        }
+    }
+
+    pub fn provisional(&self) -> bool {
+        self.phase == "prefill"
     }
 }
 
@@ -54,8 +143,10 @@ pub enum PromptRateBasis {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Section {
     Overview,
+    Service,
     Throughput,
     Slots,
+    Cache,
     Gpu,
     Help,
 }
@@ -63,9 +154,11 @@ pub enum Section {
 impl Section {
     pub fn next(&self) -> Self {
         match self {
-            Section::Overview => Section::Throughput,
+            Section::Overview => Section::Service,
+            Section::Service => Section::Throughput,
             Section::Throughput => Section::Slots,
-            Section::Slots => Section::Gpu,
+            Section::Slots => Section::Cache,
+            Section::Cache => Section::Gpu,
             Section::Gpu => Section::Overview,
             Section::Help => Section::Overview,
         }
@@ -73,17 +166,21 @@ impl Section {
     pub fn prev(&self) -> Self {
         match self {
             Section::Overview => Section::Gpu,
-            Section::Throughput => Section::Overview,
+            Section::Service => Section::Overview,
+            Section::Throughput => Section::Service,
             Section::Slots => Section::Throughput,
-            Section::Gpu => Section::Slots,
+            Section::Cache => Section::Slots,
+            Section::Gpu => Section::Cache,
             Section::Help => Section::Overview,
         }
     }
     pub fn name(&self) -> &str {
         match self {
             Section::Overview => "Overview",
+            Section::Service => "Service",
             Section::Throughput => "Throughput",
             Section::Slots => "Slots",
+            Section::Cache => "Cache",
             Section::Gpu => "GPU",
             Section::Help => "Help",
         }
@@ -123,6 +220,9 @@ pub struct App {
     // Previous state is tracked per lane so one slot resetting cannot erase
     // progress made by another slot in the same polling interval.
     prev_slot_counters: HashMap<i64, SlotCounters>,
+    active_cache_requests: HashMap<i64, CacheRequestObservation>,
+    completed_cache_totals: CacheTotals,
+    last_cache_request: Option<CacheRequestObservation>,
     prev_rate_time: Option<Instant>,
     next_poll: Instant,
     // Background snapshot provider. All network/GPU work happens off the UI
@@ -205,6 +305,9 @@ impl App {
             theme_before_picker: active_theme_index,
             background_before_picker: theme_background,
             prev_slot_counters: HashMap::new(),
+            active_cache_requests: HashMap::new(),
+            completed_cache_totals: CacheTotals::default(),
+            last_cache_request: None,
             prev_rate_time: None,
             // The first collection is due immediately, before the first draw.
             next_poll: now,
@@ -223,6 +326,11 @@ impl App {
         self.scroll = 0;
     }
 
+    pub fn select_section(&mut self, section: Section) {
+        self.current_section = section;
+        self.scroll = 0;
+    }
+
     pub fn scroll_up(&mut self) {
         if self.scroll > 0 {
             self.scroll -= 1;
@@ -233,6 +341,10 @@ impl App {
         let max_scroll = match self.current_section {
             Section::Slots => self.snapshot.slots.len().saturating_sub(1),
             Section::Gpu => self.snapshot.gpus.len().saturating_sub(1),
+            // The rich service view wraps differently with terminal width.
+            // A generous bound keeps the bottom reachable on the minimum-size
+            // layout; rendering safely clips any harmless overscroll.
+            Section::Service | Section::Cache => 80,
             _ => 0,
         };
         self.scroll = (self.scroll as usize + 1).min(max_scroll) as u16;
@@ -491,6 +603,10 @@ impl App {
             }
         }
 
+        if snap.slots_error.is_none() {
+            self.observe_cache_slots(&snap.slots, now);
+        }
+
         self.prev_slot_counters = snap
             .slots
             .iter()
@@ -582,6 +698,70 @@ impl App {
             format!("{}h {:02}m {:02}s", h, m, s)
         } else {
             format!("{:02}m {:02}s", m, s)
+        }
+    }
+
+    pub fn cache_observed_totals(&self) -> CacheTotals {
+        let mut totals = self.completed_cache_totals;
+        for request in self.active_cache_requests.values() {
+            totals.include(request);
+        }
+        totals
+    }
+
+    pub fn last_cache_request(&self) -> Option<&CacheRequestObservation> {
+        self.last_cache_request.as_ref()
+    }
+
+    pub fn active_cache_requests(&self) -> impl Iterator<Item = &CacheRequestObservation> {
+        self.active_cache_requests.values()
+    }
+
+    pub(crate) fn observe_cache_slots(&mut self, slots: &[SlotInfo], now: Instant) {
+        let active_slot_ids: HashSet<i64> = slots
+            .iter()
+            .filter(|slot| slot.is_processing)
+            .map(|slot| slot.id)
+            .collect();
+
+        for slot in slots.iter().filter(|slot| slot.is_processing) {
+            let mut current = CacheRequestObservation::from_slot(slot, now);
+            if let Some(previous) = self.active_cache_requests.remove(&slot.id) {
+                let compatible_task_ids = previous.task_id == current.task_id
+                    || previous.task_id.is_none()
+                    || current.task_id.is_none();
+                let counters_are_continuous = current.input_tokens() >= previous.input_tokens();
+
+                if compatible_task_ids && counters_are_continuous {
+                    current.task_id = current.task_id.or(previous.task_id);
+                } else {
+                    self.finish_cache_request(previous);
+                }
+            }
+            self.active_cache_requests.insert(slot.id, current);
+        }
+
+        let finished_slots: Vec<i64> = self
+            .active_cache_requests
+            .keys()
+            .filter(|slot_id| !active_slot_ids.contains(slot_id))
+            .copied()
+            .collect();
+        for slot_id in finished_slots {
+            if let Some(request) = self.active_cache_requests.remove(&slot_id) {
+                self.finish_cache_request(request);
+            }
+        }
+    }
+
+    fn finish_cache_request(&mut self, request: CacheRequestObservation) {
+        self.completed_cache_totals.include(&request);
+        let is_newest = self
+            .last_cache_request
+            .as_ref()
+            .is_none_or(|last| request.last_seen >= last.last_seen);
+        if is_newest {
+            self.last_cache_request = Some(request);
         }
     }
 }
@@ -750,6 +930,108 @@ fn slot_decoded_delta(previous: &HashMap<i64, SlotCounters>, slots: &[SlotInfo])
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn section_navigation_includes_service_details_in_both_directions() {
+        assert_eq!(Section::Overview.next(), Section::Service);
+        assert_eq!(Section::Service.next(), Section::Throughput);
+        assert_eq!(Section::Throughput.prev(), Section::Service);
+        assert_eq!(Section::Service.prev(), Section::Overview);
+        assert_eq!(Section::Service.name(), "Service");
+        assert_eq!(Section::Slots.next(), Section::Cache);
+        assert_eq!(Section::Cache.next(), Section::Gpu);
+        assert_eq!(Section::Gpu.prev(), Section::Cache);
+        assert_eq!(Section::Cache.prev(), Section::Slots);
+        assert_eq!(Section::Cache.name(), "Cache");
+    }
+
+    #[test]
+    fn direct_section_selection_resets_scroll_position() {
+        let mut app = App::new("http://127.0.0.1:8080".to_string());
+        app.scroll = 12;
+
+        app.select_section(Section::Cache);
+
+        assert_eq!(app.current_section, Section::Cache);
+        assert_eq!(app.scroll, 0);
+    }
+
+    fn cache_slot(
+        id: i64,
+        task_id: i64,
+        reused_tokens: i64,
+        evaluated_tokens: i64,
+        output_tokens: i64,
+    ) -> SlotInfo {
+        SlotInfo {
+            id,
+            task_id: Some(task_id),
+            context_capacity: 4096,
+            is_processing: true,
+            context_tokens: reused_tokens + evaluated_tokens + output_tokens,
+            prompt_tokens_cached: reused_tokens,
+            prompt_tokens_processed: evaluated_tokens,
+            decoded_tokens: output_tokens,
+            ..SlotInfo::default()
+        }
+    }
+
+    #[test]
+    fn cache_observations_update_a_task_without_double_counting_polls() {
+        let mut app = App::new("http://127.0.0.1:8080".to_string());
+        let now = Instant::now();
+
+        app.observe_cache_slots(&[cache_slot(0, 7, 80, 20, 0)], now);
+        app.observe_cache_slots(
+            &[cache_slot(0, 7, 80, 40, 5)],
+            now + Duration::from_millis(500),
+        );
+
+        let totals = app.cache_observed_totals();
+        assert_eq!(totals.requests, 1);
+        assert_eq!(totals.reused_tokens, 80);
+        assert_eq!(totals.evaluated_tokens, 40);
+        assert_eq!(totals.input_tokens(), 120);
+        assert!((totals.reuse_percent() - 66.666).abs() < 0.01);
+        assert!(app.last_cache_request().is_none());
+    }
+
+    #[test]
+    fn cache_observations_finalize_task_transitions_and_idle_slots() {
+        let mut app = App::new("http://127.0.0.1:8080".to_string());
+        let now = Instant::now();
+
+        app.observe_cache_slots(&[cache_slot(0, 7, 80, 40, 5)], now);
+        app.observe_cache_slots(&[cache_slot(0, 8, 10, 90, 2)], now + Duration::from_secs(1));
+
+        let totals = app.cache_observed_totals();
+        assert_eq!(totals.requests, 2);
+        assert_eq!(totals.reused_tokens, 90);
+        assert_eq!(totals.evaluated_tokens, 130);
+        assert_eq!(
+            app.last_cache_request().and_then(|last| last.task_id),
+            Some(7)
+        );
+
+        app.observe_cache_slots(&[], now + Duration::from_secs(2));
+        let last = app.last_cache_request().expect("last observed request");
+        assert_eq!(last.task_id, Some(8));
+        assert_eq!(last.input_tokens(), 100);
+        assert_eq!(app.cache_observed_totals().requests, 2);
+    }
+
+    #[test]
+    fn cache_counter_regression_starts_a_new_observation_even_if_task_id_repeats() {
+        let mut app = App::new("http://127.0.0.1:8080".to_string());
+        let now = Instant::now();
+
+        app.observe_cache_slots(&[cache_slot(0, 7, 80, 40, 5)], now);
+        app.observe_cache_slots(&[cache_slot(0, 7, 5, 15, 0)], now + Duration::from_secs(1));
+
+        let totals = app.cache_observed_totals();
+        assert_eq!(totals.requests, 2);
+        assert_eq!(totals.input_tokens(), 140);
+    }
 
     fn slot(id: i64, task_id: i64, decoded_tokens: i64) -> SlotInfo {
         SlotInfo {

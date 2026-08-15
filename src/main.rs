@@ -9,7 +9,7 @@ mod collect;
 mod theme;
 mod ui;
 
-use app::App;
+use app::{App, Section};
 use theme::{parse_update_ms, ThemeCatalog, ThemePreferences};
 
 const HELP: &str = r#"ltop — a btop-inspired llama.cpp monitor
@@ -28,7 +28,7 @@ Options:
   -h, --help              Print help
   -V, --version           Print version
 
-Inside ltop, use -/+ to change polling by 100 ms and t to preview themes.
+Inside ltop, press c for cache details, -/+ to change polling, and t to preview themes.
 "#;
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -292,6 +292,12 @@ fn run(
                             KeyCode::Up => app.scroll_up(),
                             KeyCode::Down => app.scroll_down(),
                             KeyCode::Char('r') | KeyCode::Char('R') => app.toggle_rate_unit(),
+                            KeyCode::Char('c') | KeyCode::Char('C') => {
+                                if app.show_help {
+                                    app.toggle_help();
+                                }
+                                app.select_section(Section::Cache)
+                            }
                             KeyCode::Char('p') | KeyCode::Char('P') => app.toggle_pause(),
                             KeyCode::Char('-') => {
                                 if let Err(error) = app.decrease_update_interval() {
